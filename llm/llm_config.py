@@ -1,23 +1,19 @@
-from langchain import HuggingFacePipeline
-from transformers import AutoTokenizer, pipeline
+from langchain_cohere import ChatCohere
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+from prompt.llm_prompt import get_prompt_template
+from llm.retriever import get_retriever
+import os
 
-# repo_id = "mistralai/Mistral-Nemo-Instruct-2407"
-repo_id = "sarvamai/sarvam-2b-v0.5"
 
-tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=repo_id, padding=True, truncation=True, max_length=512)
-question_answerer = pipeline(
-    "question-answering", 
-    model=repo_id, 
-    tokenizer=tokenizer,
-    return_tensors='pt'
-)
+class llm:
+    key = "M6kNzVruUj6YfaH3VDJpF9zrPpTtxou2Z885NKNb"
+    os.environ["COHERE_API_KEY"] = key
+    llm = ChatCohere(model="command-r-plus")
 
-class LLMConfig:
-    def __init__(self):
-        self.repo_id = repo_id
-        self.tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        self.llm = HuggingFacePipeline(pipeline=question_answerer,model_kwargs={"temperature": 0.7, "max_length": 512})
-
-    def llm_call(self):
-        print("llm_call")
-    
+    def get_rag_chain(self):  
+        prompt = get_prompt_template();
+        retriever=get_retriever()
+        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+        return rag_chain

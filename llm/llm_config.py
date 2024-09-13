@@ -5,7 +5,6 @@ from prompt.llm_prompt import get_prompt_template
 from llm.retriever import get_retriever
 import os
 
-
 class llm:
     key = "M6kNzVruUj6YfaH3VDJpF9zrPpTtxou2Z885NKNb"
     os.environ["COHERE_API_KEY"] = key

@@ -1,8 +1,5 @@
 from fastapi import FastAPI
 from llm.llm_config import llm
-from contextlib import asynccontextmanager
-import os
-
 
 # @asynccontextmanager
 # async def lifespan(app: FastAPI):
@@ -14,7 +11,7 @@ myApp = FastAPI()
 @myApp.get("/llm/search")
 def search():
     rag_chain=llm().get_rag_chain()
-    res = rag_chain.invoke({"input": "What is total work experience?"})
+    res = rag_chain.invoke({"input": "which type of content is in this file?"})
     print(res['answer'])
     return {"answer": res['answer']}
     

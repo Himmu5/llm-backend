@@ -10,9 +10,9 @@ class llm:
     os.environ["COHERE_API_KEY"] = key
     llm = ChatCohere(model="command-r-plus")
 
-    def get_rag_chain(self):  
+    def get_rag_chain(self, fileName):  
         prompt = get_prompt_template();
-        retriever=get_retriever()
+        retriever=get_retriever(fileName)
         question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
         rag_chain = create_retrieval_chain(retriever, question_answer_chain)
         return rag_chain

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from llm.llm_config import llm
@@ -13,9 +13,14 @@ from llm.response_formatter import format_response, format_for_chat
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette import EventSourceResponse
 from google.cloud import storage
+from google.cloud.exceptions import GoogleCloudError
 from pathlib import Path
 import shutil
 import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Request models
 class Message(BaseModel):
@@ -42,6 +47,7 @@ class FinancialAnalysisRequest(BaseModel):
 # GCP Configuration
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "himanshu-rag")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
 # Local fallback directory
 UPLOAD_DIR = Path(__file__).parent / "uploads"
@@ -50,15 +56,65 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # Initialize GCS
 gcs_client = None
 bucket = None
-try:
-    if GCP_PROJECT_ID:
-        gcs_client = storage.Client(project=GCP_PROJECT_ID)
-    else:
-        gcs_client = storage.Client()
-    bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-    print(f"✅ GCS connected to bucket: {GCS_BUCKET_NAME}")
-except Exception as e:
-    print(f"⚠️ GCS not available, using local storage: {e}")
+gcs_error = None
+gcs_available = False
+
+def initialize_gcs():
+    """Initialize GCS client and bucket"""
+    global gcs_client, bucket, gcs_error, gcs_available
+    
+    try:
+        # Check if service account key file is provided
+        if GOOGLE_APPLICATION_CREDENTIALS:
+            if not os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+                raise FileNotFoundError(f"Service account key file not found: {GOOGLE_APPLICATION_CREDENTIALS}")
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
+        
+        # Initialize client
+        if GCP_PROJECT_ID:
+            gcs_client = storage.Client(project=GCP_PROJECT_ID)
+            print(f"🔧 Initializing GCS with project: {GCP_PROJECT_ID}")
+        else:
+            gcs_client = storage.Client()
+            print(f"🔧 Initializing GCS with default credentials")
+        
+        # Get bucket reference
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+        
+        # Test connection by checking if bucket exists
+        if not bucket.exists():
+            raise Exception(f"Bucket '{GCS_BUCKET_NAME}' does not exist. Please create it in GCP Console.")
+        
+        # Test write permissions by checking bucket metadata
+        bucket.reload()
+        
+        gcs_available = True
+        print(f"✅ GCS connected successfully to bucket: {GCS_BUCKET_NAME}")
+        return True
+        
+    except FileNotFoundError as e:
+        gcs_error = str(e)
+        print(f"❌ GCS initialization failed: {e}")
+        return False
+    except GoogleCloudError as e:
+        gcs_error = str(e)
+        error_code = getattr(e, 'code', None)
+        if error_code == 403:
+            print(f"❌ GCS access denied (403). Check:")
+            print(f"   1. Billing is enabled for your GCP project")
+            print(f"   2. Service account has Storage Admin role")
+            print(f"   3. Bucket permissions are correct")
+        else:
+            print(f"❌ GCS error ({error_code}): {e}")
+        return False
+    except Exception as e:
+        gcs_error = str(e)
+        print(f"⚠️ GCS not available: {e}")
+        print(f"   Using local storage fallback")
+        return False
+
+# Initialize GCS on startup
+initialize_gcs()
 
 myApp = FastAPI()
 
@@ -82,12 +138,65 @@ myApp.add_middleware(
 def health():
     return {"status": "ok"}
 
+@myApp.get("/llm/gcs/status")
+def gcs_status():
+    """Check GCS connection status and configuration"""
+    status = {
+        "available": gcs_available,
+        "bucket_name": GCS_BUCKET_NAME,
+        "project_id": GCP_PROJECT_ID if GCP_PROJECT_ID else "Using default credentials",
+        "error": gcs_error if not gcs_available else None
+    }
+    
+    if gcs_available and bucket:
+        try:
+            # Test bucket access
+            bucket.reload()
+            status["bucket_exists"] = True
+            status["bucket_location"] = bucket.location
+        except Exception as e:
+            status["bucket_exists"] = False
+            status["error"] = str(e)
+    
+    return status
+
+@myApp.post("/llm/gcs/reinitialize")
+def reinitialize_gcs():
+    """Reinitialize GCS connection (useful after fixing billing/permissions)"""
+    global gcs_client, bucket, gcs_error, gcs_available
+    
+    result = initialize_gcs()
+    
+    return {
+        "success": result,
+        "available": gcs_available,
+        "bucket_name": GCS_BUCKET_NAME,
+        "project_id": GCP_PROJECT_ID if GCP_PROJECT_ID else "Using default credentials",
+        "error": gcs_error if not gcs_available else None,
+        "message": "GCS reinitialized successfully" if result else f"GCS initialization failed: {gcs_error}"
+    }
+
 @myApp.post("/llm/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload file to GCS or local storage"""
-    try:
-        # Try GCS first
-        if bucket:
+async def upload_file(
+    file: UploadFile = File(...),
+    force_gcs: bool = Query(False, description="Force GCS upload, fail if not available")
+):
+    """
+    Upload file to GCS or local storage
+    
+    Args:
+        file: The file to upload
+        force_gcs: If True, will fail if GCS is not available instead of falling back to local
+    """
+    # Read file content once to use for both GCS and local fallback
+    file_content = await file.read()
+    
+    # Try GCS first if available
+    if gcs_available and bucket:
+        try:
+            # Reset file pointer to beginning
+            file.file.seek(0)
+            
             blob = bucket.blob(file.filename)
             blob.upload_from_file(file.file, content_type=file.content_type)
             
@@ -101,24 +210,57 @@ async def upload_file(file: UploadFile = File(...)):
                 "url": public_url,
                 "storage": "gcs"
             }
-        else:
-            # Fallback to local storage
-            file_path = UPLOAD_DIR / file.filename
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+        except GoogleCloudError as e:
+            error_code = getattr(e, 'code', None)
+            error_msg = str(e)
             
-            print(f"✅ File saved locally: {file_path}")
+            if force_gcs:
+                # If force_gcs is True, don't fall back - return error
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"GCS upload failed ({error_code}): {error_msg}. "
+                           f"Check billing and permissions. Error: {gcs_error or error_msg}"
+                )
             
-            return {
-                "message": "File uploaded locally",
-                "filename": file.filename,
-                "path": str(file_path),
-                "storage": "local"
-            }
+            # GCS upload failed - fall back to local storage
+            print(f"⚠️ GCS upload failed ({error_code}): {error_msg}")
+            print(f"   Falling back to local storage")
+        except Exception as e:
+            if force_gcs:
+                raise HTTPException(status_code=500, detail=f"GCS upload failed: {str(e)}")
+            print(f"⚠️ GCS upload failed ({e}), falling back to local storage")
+    elif force_gcs:
+        # GCS not available but force_gcs is True
+        raise HTTPException(
+            status_code=503,
+            detail=f"GCS is not available. Error: {gcs_error or 'GCS not initialized'}. "
+                   f"Please check your GCP configuration and billing."
+        )
     
+    # Fallback to local storage (either bucket is None or GCS upload failed)
+    try:
+        file_path = UPLOAD_DIR / file.filename
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_content)
+        
+        print(f"✅ File saved locally: {file_path}")
+        
+        response = {
+            "message": "File uploaded locally",
+            "filename": file.filename,
+            "path": str(file_path),
+            "storage": "local"
+        }
+        
+        # Add warning if GCS was attempted but failed
+        if gcs_available and bucket:
+            response["warning"] = "GCS upload failed, saved locally instead"
+            response["gcs_error"] = gcs_error
+        
+        return response
     except Exception as e:
-        print(f"❌ Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Local upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
 @myApp.get("/llm/files")
 def list_files():
